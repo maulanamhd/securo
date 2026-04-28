@@ -398,6 +398,52 @@ async def get_income_expenses_report(
         expenses = abs(float(row[2] or 0))
         data_map[row[0]] = (income, expenses)
 
+    # Layer in the viewer's share from group splits — concert tickets
+    # paid by a friend show up as the viewer's expense in their P/L
+    # picture, just like in /transactions and the dashboard.
+    from app.models.group import GroupMember
+    from app.models.transaction_split import TransactionSplit
+
+    viewer_member_ids = select(GroupMember.id).where(
+        GroupMember.linked_user_id == user_id
+    )
+    shared_result = await session.execute(
+        select(
+            label_expr,
+            func.sum(
+                case(
+                    (Transaction.type == "credit", TransactionSplit.share_amount),
+                    else_=0,
+                )
+            ),
+            func.sum(
+                case(
+                    (Transaction.type == "debit", TransactionSplit.share_amount),
+                    else_=0,
+                )
+            ),
+        )
+        .select_from(TransactionSplit)
+        .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
+        .where(
+            TransactionSplit.group_member_id.in_(viewer_member_ids),
+            Transaction.user_id != user_id,
+            report_date >= start,
+            report_date <= today,
+            Transaction.source != "opening_balance",
+            counts_as_pnl(),
+        )
+        .group_by(label_expr)
+    )
+    for row in shared_result.all():
+        share_income = float(row[1] or 0)
+        share_expenses = abs(float(row[2] or 0))
+        existing_income, existing_expenses = data_map.get(row[0], (0.0, 0.0))
+        data_map[row[0]] = (
+            existing_income + share_income,
+            existing_expenses + share_expenses,
+        )
+
     # Add recurring projections for each month in the range (consistent with dashboard)
     from app.services.dashboard_service import _month_range, _get_recurring_projections
     from app.services.fx_rate_service import convert as fx_convert

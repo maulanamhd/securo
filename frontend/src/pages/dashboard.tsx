@@ -28,7 +28,7 @@ import {
   ResponsiveContainer,
 } from 'recharts'
 import { CheckCircle2, CalendarIcon, Paperclip, Target, ArrowUpDown } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { ICON_MAP } from '@/lib/category-icons'
 import { PageHeader } from '@/components/page-header'
 import { CategoryIcon } from '@/components/category-icon'
@@ -70,6 +70,7 @@ function formatDate(dateStr: string, locale = 'pt-BR') {
 
 export default function DashboardPage() {
   const { t, i18n } = useTranslation()
+  const navigate = useNavigate()
   const { mask, privacyMode, MASK } = usePrivacyMode()
   const { user } = useAuth()
   const userCurrency = user?.preferences?.currency_display ?? 'USD'
@@ -279,18 +280,24 @@ export default function DashboardPage() {
     categoryColor: string | null
     isProjected: boolean
     attachmentCount: number
+    isShared: boolean
+    parentTotal: number | null
+    groupId: string | null
   }
 
   const TX_PER_PAGE = 10
   const allDisplayRows = useMemo(() => {
     const rows: DisplayRow[] = []
     for (const tx of currentMonthTxs?.items ?? []) {
+      const isShared = !!tx.is_shared
+      const displayAmount =
+        isShared && tx.viewer_share != null ? Number(tx.viewer_share) : Number(tx.amount)
       rows.push({
         key: tx.id,
         description: tx.description,
         date: tx.date,
         type: tx.type,
-        amount: Number(tx.amount),
+        amount: displayAmount,
         amountPrimary: tx.amount_primary != null ? Number(tx.amount_primary) : null,
         currency: tx.currency,
         categoryIcon: tx.category?.icon ?? null,
@@ -298,6 +305,9 @@ export default function DashboardPage() {
         categoryColor: tx.category?.color ?? null,
         isProjected: false,
         attachmentCount: tx.attachment_count ?? 0,
+        isShared,
+        parentTotal: isShared ? Number(tx.amount) : null,
+        groupId: tx.group_id ?? null,
       })
     }
     for (const pt of projectedTxs ?? []) {
@@ -314,6 +324,9 @@ export default function DashboardPage() {
         categoryColor: pt.category_color ?? null,
         isProjected: true,
         attachmentCount: 0,
+        isShared: false,
+        parentTotal: null,
+        groupId: null,
       })
     }
     rows.sort((a, b) => txSortDesc ? b.date.localeCompare(a.date) : a.date.localeCompare(b.date))
@@ -420,6 +433,27 @@ export default function DashboardPage() {
                           </span>
                         ))}
                       </div>
+                    )}
+                    {/* Net of pending group shares — show only when
+                        meaningfully nonzero so users without groups
+                        see the same UI as before. */}
+                    {summary && Math.abs(summary.pending_shares_net) >= 0.01 && (
+                      <p
+                        className={`text-[10px] tabular-nums mt-0.5 ${
+                          summary.pending_shares_net < 0 ? 'text-rose-500' : 'text-emerald-600'
+                        }`}
+                        title={t('dashboard.pendingSharesTooltip')}
+                      >
+                        {summary.pending_shares_net < 0
+                          ? t('dashboard.pendingSharesOwe', {
+                              net: mask(formatCurrency(totalBalance + summary.pending_shares_net, primaryCurrency, locale)),
+                              owed: mask(formatCurrency(Math.abs(summary.pending_shares_net), primaryCurrency, locale)),
+                            })
+                          : t('dashboard.pendingSharesOwed', {
+                              net: mask(formatCurrency(totalBalance + summary.pending_shares_net, primaryCurrency, locale)),
+                              owed: mask(formatCurrency(summary.pending_shares_net, primaryCurrency, locale)),
+                            })}
+                      </p>
                     )}
                   </div>
                 )}
@@ -856,9 +890,21 @@ export default function DashboardPage() {
                   {pagedRows.map((row) => (
                     <TableRow
                       key={row.key}
-                      className={`border-b border-border last:border-0 ${!row.isProjected ? 'cursor-pointer hover:bg-muted' : ''}`}
+                      className={`border-b border-border last:border-0 ${
+                        row.isProjected
+                          ? ''
+                          : row.isShared
+                            ? 'cursor-pointer hover:bg-muted'
+                            : 'cursor-pointer hover:bg-muted'
+                      }`}
                       onClick={() => {
                         if (row.isProjected) return
+                        if (row.isShared) {
+                          // Shared rows belong to another user — open the
+                          // group instead of the (locked) edit dialog.
+                          if (row.groupId) navigate(`/groups/${row.groupId}`)
+                          return
+                        }
                         const tx = currentMonthTxs?.items.find((t) => t.id === row.key)
                         if (tx) { setEditingTx(tx); setDialogOpen(true) }
                       }}
@@ -869,6 +915,11 @@ export default function DashboardPage() {
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
                               <p className="text-sm font-semibold text-foreground truncate">{row.description}</p>
+                              {row.isShared && (
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-violet-100 text-violet-700 dark:bg-violet-950/40 dark:text-violet-300 shrink-0 uppercase tracking-wide">
+                                  {t('splitGroups.sharedShortBadge')}
+                                </span>
+                              )}
                               {row.isProjected && (
                                 <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-violet-100 text-violet-600 shrink-0">
                                   {t('transactions.recurringBadge')}
@@ -886,7 +937,14 @@ export default function DashboardPage() {
                         <span className={`text-sm font-semibold tabular-nums ${row.type === 'credit' ? 'text-emerald-600' : 'text-rose-500'}`}>
                           {mask(`${row.type === 'credit' ? '+' : '-'}${formatCurrency(Math.abs(row.amount), row.currency, locale)}`)}
                         </span>
-                        {row.currency !== userCurrency && row.amountPrimary != null && (
+                        {row.isShared && row.parentTotal != null && (
+                          <span className="block text-[10px] text-muted-foreground tabular-nums">
+                            {t('splitGroups.sharedRowParent', {
+                              total: formatCurrency(Math.abs(row.parentTotal), row.currency, locale),
+                            })}
+                          </span>
+                        )}
+                        {!row.isShared && row.currency !== userCurrency && row.amountPrimary != null && (
                           <span className="block text-[10px] text-muted-foreground tabular-nums">
                             {mask(formatCurrency(Math.abs(row.amountPrimary), userCurrency, locale))}
                           </span>

@@ -13,7 +13,11 @@ from app.models.transaction import Transaction
 from app.models.category import Category
 from app.models.recurring_transaction import RecurringTransaction
 from app.schemas.dashboard import DashboardSummary, SpendingByCategory, MonthlyTrend, ProjectedTransaction, DailyBalance, BalanceHistory
-from app.services._query_filters import counts_as_pnl
+from app.services._query_filters import (
+    counts_as_pnl,
+    viewer_shared_pnl,
+    viewer_shared_spending_by_category,
+)
 from app.services.admin_service import get_credit_card_accounting_mode
 from app.services.recurring_transaction_service import get_occurrences_in_range
 from app.services.asset_service import get_total_asset_value
@@ -133,6 +137,15 @@ async def get_summary(
     monthly_income = float(monthly_row[0] or 0)
     monthly_expenses = float(monthly_row[1] or 0)
 
+    # Add the viewer's share from group splits where they're a linked
+    # member but not the owner. Their concert ticket paid by a friend
+    # is a real expense in their P/L picture.
+    shared_income, shared_expenses = await viewer_shared_pnl(
+        session, user_id, month_start, month_end, use_effective_date=False
+    )
+    monthly_income += shared_income
+    monthly_expenses += shared_expenses
+
     # Save real-only totals before adding projections (used for primary init)
     real_monthly_income = monthly_income
     real_monthly_expenses = monthly_expenses
@@ -215,6 +228,59 @@ async def get_summary(
         monthly_income_primary = float(primary_row[0] or 0)
         monthly_expenses_primary = abs(float(primary_row[1] or 0))
 
+    # Add the viewer's shared shares to primary totals too. The shares
+    # are stored in the parent transaction's currency, so we convert
+    # each currency bucket separately rather than re-using shared_income
+    # / shared_expenses (which were summed without conversion).
+    from app.models.group import GroupMember
+    from app.models.transaction_split import TransactionSplit
+
+    viewer_member_ids = select(GroupMember.id).where(
+        GroupMember.linked_user_id == user_id
+    )
+    shared_currency_rows = await session.execute(
+        select(
+            Transaction.currency,
+            func.sum(
+                case(
+                    (Transaction.type == "credit", TransactionSplit.share_amount),
+                    else_=0,
+                )
+            ),
+            func.sum(
+                case(
+                    (Transaction.type == "debit", TransactionSplit.share_amount),
+                    else_=0,
+                )
+            ),
+        )
+        .select_from(TransactionSplit)
+        .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
+        .where(
+            TransactionSplit.group_member_id.in_(viewer_member_ids),
+            Transaction.user_id != user_id,
+            Transaction.source != "opening_balance",
+            report_date >= month_start,
+            report_date < month_end,
+            counts_as_pnl(),
+        )
+        .group_by(Transaction.currency)
+    )
+    for row in shared_currency_rows.all():
+        cur = row[0]
+        in_credit = float(row[1] or 0)
+        in_debit = float(row[2] or 0)
+        if in_credit:
+            credit_pri, _ = await convert(
+                session, Decimal(str(in_credit)), cur, primary_currency
+            )
+            monthly_income_primary += float(credit_pri)
+        if in_debit:
+            debit_pri, _ = await convert(
+                session, Decimal(str(in_debit)), cur, primary_currency
+            )
+            monthly_expenses_primary += abs(float(debit_pri))
+
     # Add recurring projections to primary totals (convert each)
     for proj in projections:
         proj_converted, _ = await convert(
@@ -232,6 +298,13 @@ async def get_summary(
         converted, _ = await convert(session, Decimal(str(amount)), currency, primary_currency)
         assets_value_primary += float(converted)
 
+    # Aggregate the user's net pending balance across all groups they
+    # participate in. We reuse the group balance computation so partial
+    # settlements are already netted out.
+    pending_shares_net = await _compute_pending_shares_net(
+        session, user_id, primary_currency
+    )
+
     return DashboardSummary(
         total_balance=total_balance,
         total_balance_primary=round(total_balance_primary, 2),
@@ -246,7 +319,64 @@ async def get_summary(
         assets_value=assets_value,
         assets_value_primary=round(assets_value_primary, 2),
         primary_currency=primary_currency,
+        pending_shares_net=round(pending_shares_net, 2),
     )
+
+
+async def _compute_pending_shares_net(
+    session: AsyncSession, user_id: uuid.UUID, primary_currency: str
+) -> float:
+    """Sum, in primary currency, the user's net position across every
+    group they belong to.
+
+    For each group:
+      - Owner: sum of (positive lines) - sum of (abs negative lines).
+        Positive net = others owe them; negative = they owe.
+      - Linked member: their own line. Positive line = they owe the
+        owner; we flip the sign so the dashboard shows it as negative
+        (net liability).
+    """
+    from app.models.group import Group, GroupMember
+    from app.services.balance_service import compute_balances
+
+    # All groups the user can see (owned + linked-as-member).
+    owned_q = await session.execute(
+        select(Group.id).where(Group.user_id == user_id)
+    )
+    owned_ids = {row[0] for row in owned_q.all()}
+    linked_q = await session.execute(
+        select(GroupMember.group_id, GroupMember.id).where(
+            GroupMember.linked_user_id == user_id
+        )
+    )
+    linked_rows = list(linked_q.all())
+    linked_ids = {row.group_id for row in linked_rows}
+    member_id_for_group = {row.group_id: row.id for row in linked_rows}
+
+    total_primary = 0.0
+    for gid in owned_ids | linked_ids:
+        balances = await compute_balances(session, gid, user_id)
+        if not balances:
+            continue
+        for line in balances["lines"]:
+            line_amount = float(line["amount"])
+            currency = line["currency"]
+            if gid in owned_ids:
+                # Positive = member owes the owner (an asset).
+                # Negative = owner owes the member (a liability).
+                signed = line_amount
+            else:
+                # Linked-member view: only the line about *us* matters
+                # to our personal net. Flip the sign — `compute_balances`
+                # frames it from the owner's perspective.
+                if line["member_id"] != member_id_for_group[gid]:
+                    continue
+                signed = -line_amount
+            converted, _ = await convert(
+                session, Decimal(str(signed)), currency, primary_currency
+            )
+            total_primary += float(converted)
+    return total_primary
 
 
 async def get_spending_by_category(
@@ -298,6 +428,45 @@ async def get_spending_by_category(
             "color": row[3] or "#6B7280",
             "total": abs(float(row[4] or 0)),
         }
+
+    # Add shared shares — the viewer's portion of group-split debits
+    # they participate in but don't own. The category comes from the
+    # parent transaction.
+    shared_by_cat = await viewer_shared_spending_by_category(
+        session, user_id, month_start, month_end,
+        use_effective_date=accounting_mode == "accrual",
+    )
+    if shared_by_cat:
+        cat_meta_cache: dict[str, dict] = {}
+        for cat_uuid, share_total in shared_by_cat.items():
+            cat_id = str(cat_uuid) if cat_uuid else None
+            if cat_id and cat_id not in cat_meta_cache and cat_id not in spending_map:
+                meta_row = (
+                    await session.execute(
+                        select(Category.name, Category.icon, Category.color).where(
+                            Category.id == cat_uuid
+                        )
+                    )
+                ).one_or_none()
+                if meta_row:
+                    cat_meta_cache[cat_id] = {
+                        "name": meta_row[0],
+                        "icon": meta_row[1],
+                        "color": meta_row[2],
+                    }
+            if cat_id in spending_map:
+                spending_map[cat_id]["total"] += share_total
+            else:
+                meta = cat_meta_cache.get(
+                    cat_id,
+                    {"name": "Sem categoria", "icon": "circle-help", "color": "#6B7280"},
+                )
+                spending_map[cat_id] = {
+                    "name": meta["name"],
+                    "icon": meta["icon"],
+                    "color": meta["color"],
+                    "total": share_total,
+                }
 
     # Add virtual recurring projections (debit only), converted to primary currency
     projections = await _get_recurring_projections(session, user_id, month_start, month_end)

@@ -25,7 +25,8 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { TransactionAttachments } from '@/components/transaction-attachments'
 import type { AttachmentPreview } from '@/components/transaction-attachments'
-import type { Transaction, RecurringTransaction } from '@/types'
+import { TransactionSplitsSection } from '@/components/transaction-splits-section'
+import type { Transaction, RecurringTransaction, TransactionSplitsInput } from '@/types'
 import { toast } from 'sonner'
 
 export type SaveAction = 'save' | 'saveAndNew' | 'saveAndDuplicate'
@@ -326,6 +327,23 @@ function TransactionForm({
   const [isRecurring, setIsRecurring] = useState(false)
   const [frequency, setFrequency] = useState<'monthly' | 'weekly' | 'yearly'>('monthly')
   const [endDate, setEndDate] = useState('')
+  // Optional split-with-group payload. `null` = leave splits as-is on
+  // update, or no splits on create. The dedicated section component
+  // owns its own UI state and surfaces a normalized payload here.
+  // Seeded from the transaction's existing splits so the edit dialog
+  // round-trips them rather than appearing empty.
+  const [splits, setSplits] = useState<TransactionSplitsInput | null>(() => {
+    const existing = (seed as Transaction | null | undefined)?.splits
+    if (!existing || existing.length === 0) return null
+    return {
+      share_type: (existing[0].share_type as TransactionSplitsInput['share_type']) ?? 'equal',
+      splits: existing.map((s) => ({
+        group_member_id: s.group_member_id,
+        share_amount: s.share_amount,
+        share_pct: s.share_pct,
+      })),
+    }
+  })
   const isCreating = !transaction
   const showConversion = currency !== userCurrency && !isSynced
   const [pendingFiles, setPendingFiles] = useState<File[]>([])
@@ -442,12 +460,17 @@ function TransactionForm({
         const overridePayload: Partial<Transaction> = isCcSelected
           ? { effective_bill_date: effectiveBillDate || null }
           : {}
+        // Splits ride along on the same payload — the backend treats
+        // `splits = null` as untouched and a present payload as full
+        // replacement.
+        const splitsPayload = splits ? { splits } : {}
         const txData = isSynced
           ? {
               category_id: categoryId || null,
               payee_id: payeeId || null,
               notes: notes.trim() || null,
               ...overridePayload,
+              ...splitsPayload,
             } as Partial<Transaction>
           : {
               description,
@@ -461,6 +484,7 @@ function TransactionForm({
               notes: notes.trim() || null,
               ...fxFields,
               ...overridePayload,
+              ...splitsPayload,
             } as Partial<Transaction>
         const recurringData = isCreating && isRecurring
           ? { frequency, end_date: endDate || undefined }
@@ -709,6 +733,13 @@ function TransactionForm({
           </div>
         )
       })()}
+
+      <TransactionSplitsSection
+        amount={parseFloat(amount) || 0}
+        currency={currency}
+        value={splits}
+        onChange={setSplits}
+      />
 
       {!isCreating && transaction ? (
         <TransactionAttachments

@@ -12,7 +12,9 @@ from app.models.transaction_attachment import TransactionAttachment
 from app.models.account import Account
 from app.models.bank_connection import BankConnection
 from app.models.payee import Payee
+from app.models.transaction_split import TransactionSplit
 from app.schemas.transaction import TransactionCreate, TransactionUpdate, TransferCreate
+from app.services import split_service
 from app.services.credit_card_service import apply_effective_date
 from app.services.rule_service import apply_rules_to_transaction
 from app.services.fx_rate_service import stamp_primary_amount, convert as fx_convert
@@ -65,6 +67,7 @@ async def get_transactions(
     accounting_mode: Optional[str] = None,
     tags: Optional[list[str]] = None,
     bill_id: Optional[uuid.UUID] = None,
+    group_id: Optional[uuid.UUID] = None,
 ) -> tuple[list[Transaction], int]:
     # In "accrual" mode, bucket/order by effective_date so list filters
     # line up with the cash-flow view used by the dashboard and reports.
@@ -75,20 +78,70 @@ async def get_transactions(
         Transaction.effective_bill_date,
         Transaction.effective_date if accounting_mode == "accrual" else Transaction.date,
     )
-    # Base query: user's own transactions (manual or via account)
+
+    # Group-scope visibility: when the caller filters by a group they
+    # have access to (owner or linked member), bypass the user-owns-it
+    # check and return that group's transactions instead. Lets a linked
+    # member view the owner's transactions for shared groups.
+    use_group_scope = False
+    if group_id is not None:
+        from app.services.group_service import get_group_visible
+
+        accessible = await get_group_visible(session, group_id, user_id)
+        if accessible is None:
+            return [], 0
+        use_group_scope = True
+
+    # Base query: user's own transactions (manual or via account), or
+    # group-scoped when `group_id` resolves to a visible group.
     base_query = (
         select(Transaction)
         .outerjoin(Account)
         .outerjoin(BankConnection)
         .outerjoin(Payee, Transaction.payee_id == Payee.id)
-        .where(
+        .options(
+            selectinload(Transaction.category),
+            selectinload(Transaction.account),
+            selectinload(Transaction.payee_entity),
+            selectinload(Transaction.splits),
+        )
+    )
+    if use_group_scope:
+        from app.models.group import GroupMember
+        from app.models.transaction_split import TransactionSplit
+
+        member_ids_subq = select(GroupMember.id).where(GroupMember.group_id == group_id)
+        tx_ids_subq = (
+            select(TransactionSplit.transaction_id)
+            .where(TransactionSplit.group_member_id.in_(member_ids_subq))
+            .distinct()
+        )
+        base_query = base_query.where(Transaction.id.in_(tx_ids_subq))
+    else:
+        # Default scope: own transactions PLUS transactions shared
+        # with the user via group splits. Shared rows surface in the
+        # viewer's ledger so their `Concert Tickets · share $90` shows
+        # up alongside their own expenses; account-balance integrity
+        # is preserved because the transaction's account_id still
+        # belongs to the original owner.
+        from app.models.group import GroupMember
+        from app.models.transaction_split import TransactionSplit
+
+        viewer_member_ids = select(GroupMember.id).where(
+            GroupMember.linked_user_id == user_id
+        )
+        shared_tx_ids = (
+            select(TransactionSplit.transaction_id)
+            .where(TransactionSplit.group_member_id.in_(viewer_member_ids))
+            .distinct()
+        )
+        base_query = base_query.where(
             or_(
                 Transaction.user_id == user_id,
                 BankConnection.user_id == user_id,
+                Transaction.id.in_(shared_tx_ids),
             )
         )
-        .options(selectinload(Transaction.category), selectinload(Transaction.account), selectinload(Transaction.payee_entity))
-    )
 
     # Exclude opening_balance transactions from the normal list unless explicitly requested
     if not include_opening_balance:
@@ -183,7 +236,59 @@ async def get_transactions(
             tx.attachment_count = counts.get(tx.id, 0)
             tx.payee_name = tx.payee_entity.name if tx.payee_entity else None
 
+        # Tag shared rows with the viewer's share + the source group.
+        # Owned rows stay as-is. We pre-compute the viewer's linked
+        # member ids → group ids once, then look up each transaction's
+        # split that targets one of those member ids.
+        if not use_group_scope:
+            await _tag_shared_view(session, transactions, user_id)
+
     return transactions, total or 0
+
+
+async def _tag_shared_view(
+    session: AsyncSession,
+    transactions: list[Transaction],
+    user_id: uuid.UUID,
+) -> None:
+    """Annotate transactions the viewer doesn't own (but is a linked
+    split member of) with `is_shared`, `viewer_share`, `group_id`.
+    Mutates the in-memory objects so Pydantic's from_attributes picks
+    them up directly."""
+    from app.models.group import GroupMember
+
+    member_rows = await session.execute(
+        select(GroupMember.id, GroupMember.group_id).where(
+            GroupMember.linked_user_id == user_id
+        )
+    )
+    member_to_group = {row.id: row.group_id for row in member_rows}
+    if not member_to_group:
+        for tx in transactions:
+            tx.is_shared = False
+            tx.viewer_share = None
+            tx.group_id = None
+        return
+
+    for tx in transactions:
+        if tx.user_id == user_id:
+            tx.is_shared = False
+            tx.viewer_share = None
+            tx.group_id = None
+            continue
+        # The viewer doesn't own this; find their split share.
+        match = next(
+            (s for s in (tx.splits or []) if s.group_member_id in member_to_group),
+            None,
+        )
+        if match is None:
+            tx.is_shared = False
+            tx.viewer_share = None
+            tx.group_id = None
+        else:
+            tx.is_shared = True
+            tx.viewer_share = match.share_amount
+            tx.group_id = member_to_group[match.group_member_id]
 
 
 async def get_transaction(
@@ -200,7 +305,11 @@ async def get_transaction(
                 BankConnection.user_id == user_id,
             ),
         )
-        .options(selectinload(Transaction.category), selectinload(Transaction.payee_entity))
+        .options(
+            selectinload(Transaction.category),
+            selectinload(Transaction.payee_entity),
+            selectinload(Transaction.splits),
+        )
     )
     transaction = result.scalar_one_or_none()
     if transaction:
@@ -263,8 +372,11 @@ async def create_transaction(
     else:
         await stamp_primary_amount(session, user_id, transaction)
 
+    if data.splits is not None:
+        await split_service.replace_splits(session, transaction, data.splits, user_id)
+
     await session.commit()
-    await session.refresh(transaction, ["category"])
+    await session.refresh(transaction, ["category", "splits"])
     return transaction
 
 
@@ -565,6 +677,11 @@ async def update_transaction(
 
     update_data = data.model_dump(exclude_unset=True)
 
+    # Splits are processed separately after column updates land so the
+    # service can validate against the new amount.
+    splits_payload = data.splits if "splits" in update_data else None
+    update_data.pop("splits", None)
+
     # Verify the new account belongs to the user before touching the row.
     # When changing the account on one side of a transfer pair, refuse to
     # collide with the paired transaction's account (a transfer must have two
@@ -654,8 +771,11 @@ async def update_transaction(
                 paired_account = await session.get(Account, paired_tx.account_id)
                 apply_effective_date(paired_tx, paired_account)
 
+    if splits_payload is not None:
+        await split_service.replace_splits(session, transaction, splits_payload, user_id)
+
     await session.commit()
-    await session.refresh(transaction)
+    await session.refresh(transaction, ["splits"])
     return transaction
 
 

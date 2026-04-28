@@ -1,9 +1,9 @@
 import { useState, useMemo, useEffect, useRef } from 'react'
 import { getAccountName } from '@/lib/account-utils'
-import { useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { transactions, categories as categoriesApi, accounts as accountsApi, recurring, payees as payeesApi, admin } from '@/lib/api'
+import { transactions, categories as categoriesApi, accounts as accountsApi, recurring, payees as payeesApi, admin, groups as groupsApi } from '@/lib/api'
 import { invalidateFinancialQueries } from '@/lib/invalidate-queries'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -40,6 +40,7 @@ function parseHashtags(notes: string | null): string[] {
 export default function TransactionsPage() {
   const { t, i18n } = useTranslation()
   const [searchParams] = useSearchParams()
+  const navigate = useNavigate()
   const locale = i18n.language === 'en' ? 'en-US' : i18n.language
   const { mask } = usePrivacyMode()
   const { user } = useAuth()
@@ -61,7 +62,28 @@ export default function TransactionsPage() {
   const [formResetKey, setFormResetKey] = useState(0)
   const [duplicateDraft, setDuplicateDraft] = useState<Partial<Transaction> | null>(null)
   const [filterPayee, setFilterPayee] = useState<string>(searchParams.get('payee_id') ?? '')
+  const [filterGroupId, setFilterGroupId] = useState<string>(searchParams.get('group_id') ?? '')
   const [tagFilters, setTagFilters] = useState<string[]>([])
+
+  // When the page is opened with a `group_id`, fetch its name so the
+  // active-filter chip is recognizable rather than a raw uuid.
+  const { data: filterGroup } = useQuery({
+    queryKey: ['groups', filterGroupId],
+    queryFn: () => groupsApi.get(filterGroupId),
+    enabled: !!filterGroupId,
+  })
+
+  // Used to resolve the group name on shared transaction rows.
+  const { data: allGroups } = useQuery({
+    queryKey: ['groups', 'all'],
+    queryFn: () => groupsApi.list(true),
+    staleTime: 60_000,
+  })
+  const groupNameById = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const g of allGroups ?? []) map.set(g.id, g.name)
+    return map
+  }, [allGroups])
 
   const addTagFilter = (tag: string) => {
     const normalized = tag.startsWith('#') ? tag : `#${tag}`
@@ -94,6 +116,7 @@ export default function TransactionsPage() {
     setSearchInput(nextQ)
     setSearchQuery(nextQ)
     setFilterPayee(searchParams.get('payee_id') ?? '')
+    setFilterGroupId(searchParams.get('group_id') ?? '')
     const nextCategory = searchParams.get('category_id')
     setFilterCategoryIds(nextCategory ? [nextCategory] : [])
     setFilterUncategorized(false)
@@ -137,7 +160,7 @@ export default function TransactionsPage() {
   }, [highlightId, searchQuery, filterPayee, filterCategoryIds, page])
 
   const { data, isLoading } = useQuery({
-    queryKey: ['transactions', page, filterAccountIds, filterCategoryIds, filterUncategorized, filterPayee, filterFrom, filterTo, searchQuery, tagFilters],
+    queryKey: ['transactions', page, filterAccountIds, filterCategoryIds, filterUncategorized, filterPayee, filterGroupId, filterFrom, filterTo, searchQuery, tagFilters],
     queryFn: () =>
       transactions.list({
         page,
@@ -145,6 +168,7 @@ export default function TransactionsPage() {
         account_ids: filterAccountIds.length > 0 ? filterAccountIds : undefined,
         category_ids: filterCategoryIds.length > 0 ? filterCategoryIds : undefined,
         payee_id: filterPayee || undefined,
+        group_id: filterGroupId || undefined,
         uncategorized: filterUncategorized ? true : undefined,
         from: filterFrom || undefined,
         to: filterTo || undefined,
@@ -464,6 +488,7 @@ export default function TransactionsPage() {
           setFilterCategoryIds([])
           setFilterUncategorized(false)
           setFilterPayee('')
+          setFilterGroupId('')
           setSearchInput('')
           setSearchQuery('')
           clearTagFilters()
@@ -473,6 +498,20 @@ export default function TransactionsPage() {
         categories={categoriesList ?? []}
         payees={payeesList ?? []}
       />
+      {filterGroupId && (
+        <div className="mb-4 flex flex-wrap items-center gap-1.5">
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-primary/15 bg-primary/5 px-3 py-1 text-xs font-medium text-primary">
+            {t('splitGroups.title')}: {filterGroup?.name ?? '…'}
+            <button
+              onClick={() => { setFilterGroupId(''); setPage(1) }}
+              className="ml-0.5 text-primary/60 hover:text-primary"
+              aria-label="Clear group filter"
+            >
+              ×
+            </button>
+          </span>
+        </div>
+      )}
       {tagFilters.length > 0 && (
         <div className="mb-4 flex flex-wrap items-center gap-1.5">
           {tagFilters.map(tag => (
@@ -531,8 +570,18 @@ export default function TransactionsPage() {
                 <TableRow
                   key={tx.id}
                   ref={tx.id === highlightId ? highlightedRowRef : undefined}
-                  className={`cursor-pointer hover:bg-muted border-b border-border last:border-0 ${selectedIds.has(tx.id) ? 'bg-primary/5' : ''}`}
-                  onClick={() => { setEditingTx(tx); setDialogOpen(true) }}
+                  className={`hover:bg-muted border-b border-border last:border-0 ${
+                    selectedIds.has(tx.id) ? 'bg-primary/5' : ''
+                  } ${tx.is_shared ? 'cursor-default' : 'cursor-pointer'}`}
+                  onClick={() => {
+                    if (tx.is_shared) {
+                      // Owned by another user — view in the group context instead.
+                      if (tx.group_id) navigate(`/groups/${tx.group_id}`)
+                      return
+                    }
+                    setEditingTx(tx)
+                    setDialogOpen(true)
+                  }}
                 >
                   <TableCell className="py-2.5 pl-4 pr-0 w-[40px]">
                     <input
@@ -549,6 +598,16 @@ export default function TransactionsPage() {
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
                           <p className="text-sm font-semibold text-foreground truncate">{tx.description}</p>
+                          {tx.is_shared && (
+                            <span
+                              className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-violet-700 bg-violet-50 border border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900 px-1.5 py-0.5 rounded-full"
+                              title={t('splitGroups.sharedRowTooltip')}
+                            >
+                              {t('splitGroups.sharedRowBadge', {
+                                group: tx.group_id ? groupNameById.get(tx.group_id) ?? '' : '',
+                              })}
+                            </span>
+                          )}
                           {!!tx.transfer_pair_id && (
                             <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-blue-600 bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded-full">
                               <ArrowLeftRight className="h-3 w-3" />
@@ -614,9 +673,37 @@ export default function TransactionsPage() {
                     )}
                   </TableCell>
                   <TableCell className="py-2.5 pr-3 md:pr-5 text-right">
-                    <span className={`text-xs md:text-sm font-bold tabular-nums ${tx.type === 'credit' ? 'text-emerald-600' : 'text-rose-500'}`}>
-                      {mask(`${tx.type === 'credit' ? '+' : '−'}${formatCurrency(Math.abs(Number(tx.amount)), tx.currency, locale)}`)}
-                    </span>
+                    {(() => {
+                      // For shared rows we show the viewer's share (the
+                      // portion that's actually theirs in financial
+                      // terms), with the parent's full amount on a small
+                      // secondary line for context.
+                      const displayAmount = tx.is_shared && tx.viewer_share != null
+                        ? Number(tx.viewer_share)
+                        : Number(tx.amount)
+                      return (
+                        <span
+                          className={`text-xs md:text-sm font-bold tabular-nums ${
+                            tx.type === 'credit' ? 'text-emerald-600' : 'text-rose-500'
+                          }`}
+                        >
+                          {mask(
+                            `${tx.type === 'credit' ? '+' : '−'}${formatCurrency(
+                              Math.abs(displayAmount),
+                              tx.currency,
+                              locale,
+                            )}`,
+                          )}
+                        </span>
+                      )
+                    })()}
+                    {tx.is_shared && (
+                      <p className="text-[10px] text-muted-foreground tabular-nums">
+                        {t('splitGroups.sharedRowParent', {
+                          total: formatCurrency(Math.abs(Number(tx.amount)), tx.currency, locale),
+                        })}
+                      </p>
+                    )}
                     {tx.amount_primary != null && tx.currency !== userCurrency && (
                       <div className="flex items-center justify-end gap-1">
                         {tx.fx_fallback && (

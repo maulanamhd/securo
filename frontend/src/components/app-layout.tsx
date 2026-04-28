@@ -87,6 +87,7 @@ const navItems: NavItem[] = [
   { type: 'link', key: 'recurring', path: '/recurring', icon: Repeat },
   { type: 'link', key: 'categories', path: '/categories', icon: Tag },
   { type: 'link', key: 'payees', path: '/payees', icon: Users },
+  { type: 'link', key: 'splitGroups', path: '/groups', icon: Users },
   { type: 'link', key: 'rules', path: '/rules', icon: SlidersHorizontal },
 ]
 

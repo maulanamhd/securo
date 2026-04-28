@@ -55,6 +55,7 @@ async def list_transactions(
     from_date: Optional[date] = Query(None, alias="from"),
     to_date: Optional[date] = Query(None, alias="to"),
     bill_id: Optional[uuid.UUID] = Query(None, description="Filter by credit-card bill (issue #92); takes precedence over from/to"),
+    group_id: Optional[uuid.UUID] = Query(None, description="Filter to transactions split through this group; widens visibility for linked members"),
     q: Optional[str] = Query(None),
     uncategorized: bool = Query(False),
     type: Optional[str] = Query(None),
@@ -77,6 +78,7 @@ async def list_transactions(
         accounting_mode=accounting_mode,
         tags=tags,
         bill_id=bill_id,
+        group_id=group_id,
     )
     primary_currency = user.primary_currency
     items = [_tag_fx_fallback(TransactionRead.model_validate(tx, from_attributes=True), primary_currency) for tx in transactions]
