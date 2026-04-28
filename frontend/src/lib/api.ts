@@ -10,6 +10,7 @@ import type {
   ConnectionSettings,
   Account,
   AccountSummary,
+  CreditCardBill,
   Transaction,
   Payee,
   PayeeSummary,
@@ -230,6 +231,10 @@ export const accounts = {
     const { data } = await api.get(`/accounts/${id}/balance-history`, { params: { from, to } })
     return data
   },
+  bills: async (id: string, limit = 24): Promise<CreditCardBill[]> => {
+    const { data } = await api.get(`/accounts/${id}/bills`, { params: { limit } })
+    return data
+  },
   close: async (id: string): Promise<Account> => {
     const { data } = await api.post(`/accounts/${id}/close`)
     return data
@@ -252,6 +257,7 @@ export const transactions = {
     type?: string
     from?: string
     to?: string
+    bill_id?: string
     q?: string
     page?: number
     limit?: number

@@ -64,11 +64,16 @@ async def get_transactions(
     category_ids: Optional[list[uuid.UUID]] = None,
     accounting_mode: Optional[str] = None,
     tags: Optional[list[str]] = None,
+    bill_id: Optional[uuid.UUID] = None,
 ) -> tuple[list[Transaction], int]:
     # In "accrual" mode, bucket/order by effective_date so list filters
     # line up with the cash-flow view used by the dashboard and reports.
-    date_col = (
-        Transaction.effective_date if accounting_mode == "accrual" else Transaction.date
+    # When the user has set a manual cycle override (effective_bill_date)
+    # we honor it FIRST regardless of accounting mode — that's the whole
+    # point of the override (issue #92, LucasFidelis suggestion).
+    date_col = func.coalesce(
+        Transaction.effective_bill_date,
+        Transaction.effective_date if accounting_mode == "accrual" else Transaction.date,
     )
     # Base query: user's own transactions (manual or via account)
     base_query = (
@@ -110,10 +115,19 @@ async def get_transactions(
         base_query = base_query.where(Transaction.transfer_pair_id.is_(None))
     if txn_type:
         base_query = base_query.where(Transaction.type == txn_type)
-    if from_date:
-        base_query = base_query.where(date_col >= from_date)
-    if to_date:
-        base_query = base_query.where(date_col <= to_date)
+    # Bill-driven filter: when the caller knows the active bill, use Pluggy's
+    # billId mapping (the bank's truth) instead of a date range. This handles
+    # cases where the bill's actual close shifted around weekends/holidays
+    # and a transaction landed in a bill whose date range doesn't include it
+    # (e.g. a 30/03 charge that the bank rolled into the May statement).
+    # Issue #92.
+    if bill_id is not None:
+        base_query = base_query.where(Transaction.bill_id == bill_id)
+    else:
+        if from_date:
+            base_query = base_query.where(date_col >= from_date)
+        if to_date:
+            base_query = base_query.where(date_col <= to_date)
     if search:
         term = f"%{search}%"
         base_query = base_query.where(
@@ -497,6 +511,51 @@ async def link_existing_as_transfer(
     return debit_tx, credit_tx
 
 
+async def _resync_bill_link_from_override(
+    session: AsyncSession, transaction: Transaction, account: Optional[Account]
+) -> None:
+    """Re-link transaction.bill_id when the manual effective_bill_date changes.
+
+    - Override SET to a date matching an existing bill's due_date → link to it.
+    - Override SET to a date with no matching bill → keep bill_id null (the
+      override still sets effective_date directly).
+    - Override CLEARED → fall back to whatever Pluggy originally tagged via
+      `creditCardMetadata.billId` in raw_data, if recoverable; else null.
+    """
+    from app.models.credit_card_bill import CreditCardBill  # local: avoid circular
+    if account is None or account.type != "credit_card":
+        return
+    override = transaction.effective_bill_date
+    if override is not None:
+        bill = (
+            await session.execute(
+                select(CreditCardBill).where(
+                    CreditCardBill.account_id == account.id,
+                    CreditCardBill.due_date == override,
+                )
+            )
+        ).scalar_one_or_none()
+        transaction.bill_id = bill.id if bill is not None else None
+        return
+    # Override cleared: try to recover the original Pluggy linkage.
+    raw_bill_id = None
+    if isinstance(transaction.raw_data, dict):
+        meta = transaction.raw_data.get("creditCardMetadata") or {}
+        raw_bill_id = meta.get("billId")
+    if raw_bill_id:
+        bill = (
+            await session.execute(
+                select(CreditCardBill).where(
+                    CreditCardBill.account_id == account.id,
+                    CreditCardBill.external_id == str(raw_bill_id),
+                )
+            )
+        ).scalar_one_or_none()
+        transaction.bill_id = bill.id if bill is not None else None
+    else:
+        transaction.bill_id = None
+
+
 async def update_transaction(
     session: AsyncSession, transaction_id: uuid.UUID, user_id: uuid.UUID, data: TransactionUpdate
 ) -> Optional[Transaction]:
@@ -558,9 +617,13 @@ async def update_transaction(
     elif needs_restamp:
         await stamp_primary_amount(session, user_id, transaction)
 
-    # Refresh effective_date when the purchase date or the account changed.
-    if "date" in update_data or "account_id" in update_data:
+    # Refresh effective_date when the purchase date, account, or the manual
+    # bill-cycle override changed. Also re-link bill_id when the override
+    # changed so the tx moves into the right cycle (issue #92 manual override).
+    if "date" in update_data or "account_id" in update_data or "effective_bill_date" in update_data:
         account_for_tx = await session.get(Account, transaction.account_id)
+        if "effective_bill_date" in update_data:
+            await _resync_bill_link_from_override(session, transaction, account_for_tx)
         apply_effective_date(transaction, account_for_tx)
 
     # Cascade changes to paired transfer transaction
