@@ -155,6 +155,56 @@ class TestApplyEffectiveDate:
         apply_effective_date(tx, account)
         assert tx.effective_date == date(2026, 4, 16)
 
+    def test_manual_effective_bill_date_override_wins(self):
+        """User-set effective_bill_date beats both Pluggy bill_due_date and
+        cycle math (issue #92, LucasFidelis manual override)."""
+        tx = Transaction(
+            user_id=uuid.uuid4(),
+            account_id=uuid.uuid4(),
+            description="x",
+            amount=Decimal("10"),
+            date=date(2026, 4, 3),
+            type="debit",
+            source="manual",
+        )
+        tx.effective_bill_date = date(2026, 6, 16)  # user explicitly says June
+        account = Account(
+            id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            name="gold",
+            type="credit_card",
+            balance=Decimal("0"),
+            statement_close_day=11,
+            payment_due_day=16,
+        )
+        # Even when sync passes a Pluggy bill_due_date, override still wins.
+        apply_effective_date(tx, account, bill_due_date=date(2026, 5, 16))
+        assert tx.effective_date == date(2026, 6, 16)
+
+    def test_manual_effective_bill_date_works_for_non_cc_too(self):
+        """The override is mainly for CC accounts but the helper applies it
+        regardless — useful if a future feature lets users override on other
+        accounts; today the schema only exposes it for CC."""
+        tx = Transaction(
+            user_id=uuid.uuid4(),
+            account_id=uuid.uuid4(),
+            description="x",
+            amount=Decimal("10"),
+            date=date(2026, 4, 3),
+            type="debit",
+            source="manual",
+        )
+        tx.effective_bill_date = date(2026, 5, 1)
+        account = Account(
+            id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            name="checking",
+            type="checking",
+            balance=Decimal("0"),
+        )
+        apply_effective_date(tx, account)
+        assert tx.effective_date == date(2026, 5, 1)
+
     def test_cc_account_without_cycle_metadata_falls_back_to_purchase_date(self):
         tx = Transaction(
             user_id=uuid.uuid4(),
@@ -658,3 +708,91 @@ class TestAccountCycleEditRecomputesEffectiveDates:
         )
         txs = result.scalars().all()
         assert all(t.effective_date == date(2026, 4, 16) for t in txs)
+
+
+# ---------------------------------------------------------------------------
+# Manual cycle override (effective_bill_date) — tx list filter must respect
+# the override regardless of accounting mode (issue #92, LucasFidelis).
+# ---------------------------------------------------------------------------
+
+
+class TestEffectiveBillDateFiltersList:
+    @pytest.mark.asyncio
+    async def test_override_moves_tx_between_cycles_in_cash_mode(
+        self, session, test_user, cc_account
+    ):
+        """A tx whose natural date falls in May, but with an effective_bill_date
+        in March, must be returned for a March-window query AND excluded from
+        a May-window query — even in cash mode (where the default filter is
+        Transaction.date)."""
+        from app.services.transaction_service import get_transactions
+        await _set_mode(session, "cash")
+        tx = await _make_tx(
+            session, test_user.id, cc_account.id,
+            date(2026, 4, 18), Decimal("55.90"),
+            effective_date=date(2026, 5, 22),
+        )
+        tx.effective_bill_date = date(2026, 3, 1)
+        await session.commit()
+
+        # March window: should include the override'd tx.
+        march_txs, _ = await get_transactions(
+            session, test_user.id, account_id=cc_account.id,
+            from_date=date(2026, 2, 16), to_date=date(2026, 3, 15),
+            accounting_mode="cash",
+        )
+        assert any(t.id == tx.id for t in march_txs)
+
+        # May window: should NOT include it anymore.
+        may_txs, _ = await get_transactions(
+            session, test_user.id, account_id=cc_account.id,
+            from_date=date(2026, 4, 16), to_date=date(2026, 5, 15),
+            accounting_mode="cash",
+        )
+        assert not any(t.id == tx.id for t in may_txs)
+
+    @pytest.mark.asyncio
+    async def test_override_moves_tx_between_cycles_in_accrual_mode(
+        self, session, test_user, cc_account
+    ):
+        """Same behavior in accrual mode — override must beat both modes'
+        default columns."""
+        from app.services.transaction_service import get_transactions
+        await _set_mode(session, "accrual")
+        tx = await _make_tx(
+            session, test_user.id, cc_account.id,
+            date(2026, 4, 18), Decimal("55.90"),
+            effective_date=date(2026, 5, 22),  # accrual would put this in May
+        )
+        tx.effective_bill_date = date(2026, 3, 1)
+        await session.commit()
+
+        march_txs, _ = await get_transactions(
+            session, test_user.id, account_id=cc_account.id,
+            from_date=date(2026, 2, 16), to_date=date(2026, 3, 15),
+            accounting_mode="accrual",
+        )
+        assert any(t.id == tx.id for t in march_txs)
+
+    @pytest.mark.asyncio
+    async def test_override_unset_falls_back_to_mode_column(
+        self, session, test_user, cc_account
+    ):
+        """Without an override, the configured accounting mode's column
+        (date for cash, effective_date for accrual) drives bucketing."""
+        from app.services.transaction_service import get_transactions
+        await _set_mode(session, "cash")
+        tx = await _make_tx(
+            session, test_user.id, cc_account.id,
+            date(2026, 4, 18), Decimal("55.90"),
+            effective_date=date(2026, 5, 22),
+        )
+        await session.commit()
+
+        # April window: cash mode uses date (Apr 18), should include
+        apr_txs, _ = await get_transactions(
+            session, test_user.id, account_id=cc_account.id,
+            from_date=date(2026, 4, 1), to_date=date(2026, 4, 30),
+            accounting_mode="cash",
+        )
+        assert any(t.id == tx.id for t in apr_txs)

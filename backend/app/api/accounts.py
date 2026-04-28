@@ -9,7 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import current_active_user
 from app.core.database import get_async_session
 from app.models.user import User
-from app.schemas.account import AccountCreate, AccountRead, AccountUpdate, AccountSummary
+from app.schemas.account import (
+    AccountCreate,
+    AccountRead,
+    AccountSummary,
+    AccountUpdate,
+    CreditCardBillRead,
+)
 from app.services import account_service
 from app.services.fx_rate_service import convert
 
@@ -89,6 +95,27 @@ async def get_account_balance_history(
             point["balance_primary"] = float(converted)
 
     return history
+
+
+@router.get("/{account_id}/bills", response_model=list[CreditCardBillRead])
+async def get_account_bills(
+    account_id: uuid.UUID,
+    limit: int = Query(24, ge=1, le=200, description="Max bills to return, newest due_date first"),
+    session: AsyncSession = Depends(get_async_session),
+    user: User = Depends(current_active_user),
+):
+    """List credit-card bills for an account, newest due_date first.
+
+    Returns an empty list for non-CC accounts and for CC accounts that have
+    no synced bills (provider doesn't expose them, or first sync hasn't
+    happened). Issue #92.
+    """
+    bills = await account_service.get_credit_card_bills(
+        session, account_id, user.id, limit=limit,
+    )
+    if bills is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
+    return bills
 
 
 @router.get("/{account_id}", response_model=AccountRead)
