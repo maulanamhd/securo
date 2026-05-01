@@ -579,6 +579,7 @@ async def get_transfer_candidates(
             selectinload(Transaction.category),
             selectinload(Transaction.account),
             selectinload(Transaction.payee_entity),
+            selectinload(Transaction.splits),
         )
     )
     candidates = list(result.scalars().all())
