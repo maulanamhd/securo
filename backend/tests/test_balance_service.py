@@ -193,6 +193,101 @@ async def test_balances_segregated_by_currency(session: AsyncSession, test_user)
 
 
 @pytest.mark.asyncio
+async def test_balance_line_dropped_when_settlement_zeroes_out_split(
+    session: AsyncSession, test_user
+):
+    """A friend who pays back exactly their share should drop off the
+    balance ledger — no zero-amount line should be returned."""
+    group, self_m, friends = await _setup(session, test_user, n_others=1)
+    friend = friends[0]
+    account = await _make_account(session, test_user.id)
+    tx = await _make_tx(session, test_user.id, account.id, "40.00")
+
+    await split_service.replace_splits(
+        session,
+        tx,
+        TransactionSplitsInput(
+            share_type="equal",
+            splits=[
+                TransactionSplitInput(group_member_id=self_m.id),
+                TransactionSplitInput(group_member_id=friend.id),
+            ],
+        ),
+        test_user.id,
+    )
+    # Friend owes 20; pays back exactly 20.
+    await settlement_service.create_settlement(
+        session,
+        group.id,
+        test_user.id,
+        GroupSettlementCreate(
+            from_member_id=friend.id,
+            to_member_id=self_m.id,
+            amount=Decimal("20.00"),
+            currency="USD",
+            date=date.today(),
+        ),
+    )
+    await session.commit()
+
+    balances = await balance_service.compute_balances(
+        session, group.id, test_user.id
+    )
+    friend_lines = [ln for ln in balances["lines"] if ln["member_id"] == friend.id]
+    assert friend_lines == []
+
+
+@pytest.mark.asyncio
+async def test_cross_member_settlements_are_ignored_in_owner_ledger(
+    session: AsyncSession, test_user
+):
+    """Settlements between two non-self members don't affect the
+    owner-ledger view (balance_service is owner-centric in v1)."""
+    group, self_m, friends = await _setup(session, test_user, n_others=2)
+    a, b = friends
+    account = await _make_account(session, test_user.id)
+
+    # Owner pays $30 split equally with A — A owes $15.
+    tx = await _make_tx(session, test_user.id, account.id, "30.00")
+    await split_service.replace_splits(
+        session,
+        tx,
+        TransactionSplitsInput(
+            share_type="equal",
+            splits=[
+                TransactionSplitInput(group_member_id=self_m.id),
+                TransactionSplitInput(group_member_id=a.id),
+            ],
+        ),
+        test_user.id,
+    )
+    # A "settles" with B — neither side is self. Should be a no-op for
+    # the owner's balance ledger.
+    await settlement_service.create_settlement(
+        session,
+        group.id,
+        test_user.id,
+        GroupSettlementCreate(
+            from_member_id=a.id,
+            to_member_id=b.id,
+            amount=Decimal("100.00"),
+            currency="USD",
+            date=date.today(),
+        ),
+    )
+    await session.commit()
+
+    balances = await balance_service.compute_balances(
+        session, group.id, test_user.id
+    )
+    by_member = {ln["member_id"]: ln["amount"] for ln in balances["lines"]}
+    # A still owes their original $15 — not adjusted by the cross-member tx.
+    assert by_member[a.id] == Decimal("15.00")
+    # B has no obligation to the owner — no line.
+    assert b.id not in by_member
+
+
+@pytest.mark.asyncio
 async def test_no_self_member_means_only_split_totals(
     session: AsyncSession, test_user
 ):

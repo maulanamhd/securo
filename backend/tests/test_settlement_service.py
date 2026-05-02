@@ -2,9 +2,13 @@ import uuid
 from datetime import date
 from decimal import Decimal
 
+import bcrypt as _bcrypt
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.account import Account
+from app.models.transaction import Transaction
+from app.models.user import User
 from app.schemas.group import GroupCreate, GroupMemberCreate
 from app.schemas.group_settlement import (
     GroupSettlementCreate,
@@ -24,6 +28,36 @@ async def _setup_group(session, user_id):
         session, group.id, user_id, GroupMemberCreate(name="Bob")
     )
     return group, a, b
+
+
+async def _make_user(session, email):
+    hashed = _bcrypt.hashpw(b"x", _bcrypt.gensalt()).decode()
+    user = User(
+        id=uuid.uuid4(),
+        email=email,
+        hashed_password=hashed,
+        is_active=True,
+        is_superuser=False,
+        is_verified=True,
+        preferences={"currency_display": "USD"},
+    )
+    session.add(user)
+    await session.flush()
+    return user
+
+
+async def _make_account(session, user_id, account_type="checking"):
+    account = Account(
+        id=uuid.uuid4(),
+        user_id=user_id,
+        name=f"Acc-{uuid.uuid4().hex[:4]}",
+        type=account_type,
+        balance=Decimal("0"),
+        currency="USD",
+    )
+    session.add(account)
+    await session.flush()
+    return account
 
 
 @pytest.mark.asyncio
@@ -138,3 +172,177 @@ async def test_settlement_owner_isolation(session: AsyncSession, test_user):
         ),
     )
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# receiver_transaction_id (migration 045): when a settlement is recorded,
+# the receiver-side credit transaction should be created (and pinned via
+# `receiver_transaction_id`) iff the receiver maps to a real Securo user
+# AND that user has a checking/savings account to receive into.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_receiver_credit_created_when_to_member_is_linked_with_account(
+    session: AsyncSession, test_user
+):
+    receiver = await _make_user(session, "rx-with-acc@example.com")
+    receiver_account = await _make_account(session, receiver.id)
+    payer_account = await _make_account(session, test_user.id)
+
+    group = await group_service.create_group(
+        session, test_user.id, GroupCreate(name="LinkedReceiver")
+    )
+    me = await group_service.create_member(
+        session, group.id, test_user.id, GroupMemberCreate(name="Me", is_self=True)
+    )
+    bob = await group_service.create_member(
+        session,
+        group.id,
+        test_user.id,
+        GroupMemberCreate(name="Bob", linked_user_id=receiver.id),
+    )
+
+    s = await settlement_service.create_settlement(
+        session,
+        group.id,
+        test_user.id,
+        GroupSettlementCreate(
+            from_member_id=me.id,
+            to_member_id=bob.id,
+            amount=Decimal("50.00"),
+            currency="USD",
+            date=date.today(),
+            account_id=payer_account.id,
+        ),
+    )
+    assert s is not None
+    assert s.receiver_transaction_id is not None
+
+    receiver_tx = await session.get(Transaction, s.receiver_transaction_id)
+    assert receiver_tx is not None
+    assert receiver_tx.user_id == receiver.id
+    assert receiver_tx.account_id == receiver_account.id
+    assert receiver_tx.type == "credit"
+    assert receiver_tx.amount == Decimal("50.00")
+    assert receiver_tx.currency == "USD"
+    assert receiver_tx.source == "settlement"
+
+
+@pytest.mark.asyncio
+async def test_receiver_credit_skipped_when_to_member_is_shadow(
+    session: AsyncSession, test_user
+):
+    """Shadow member (no linked_user_id, not is_self) — there's no real
+    user on the receiving side, so no credit transaction is created."""
+    payer_account = await _make_account(session, test_user.id)
+    group = await group_service.create_group(
+        session, test_user.id, GroupCreate(name="ShadowReceiver")
+    )
+    me = await group_service.create_member(
+        session, group.id, test_user.id, GroupMemberCreate(name="Me", is_self=True)
+    )
+    shadow = await group_service.create_member(
+        session, group.id, test_user.id, GroupMemberCreate(name="Shadow")
+    )
+
+    s = await settlement_service.create_settlement(
+        session,
+        group.id,
+        test_user.id,
+        GroupSettlementCreate(
+            from_member_id=me.id,
+            to_member_id=shadow.id,
+            amount=Decimal("10.00"),
+            currency="USD",
+            date=date.today(),
+            account_id=payer_account.id,
+        ),
+    )
+    assert s is not None
+    assert s.receiver_transaction_id is None
+
+
+@pytest.mark.asyncio
+async def test_receiver_credit_skipped_when_linked_user_has_no_cash_account(
+    session: AsyncSession, test_user
+):
+    """Linked receiver, but their only account is a credit card (not
+    checking/savings). The mirror credit can't be placed and is silently
+    skipped — settlement is still recorded."""
+    receiver = await _make_user(session, "rx-cc-only@example.com")
+    await _make_account(session, receiver.id, account_type="credit_card")
+    payer_account = await _make_account(session, test_user.id)
+
+    group = await group_service.create_group(
+        session, test_user.id, GroupCreate(name="CCOnly")
+    )
+    me = await group_service.create_member(
+        session, group.id, test_user.id, GroupMemberCreate(name="Me", is_self=True)
+    )
+    bob = await group_service.create_member(
+        session,
+        group.id,
+        test_user.id,
+        GroupMemberCreate(name="Bob", linked_user_id=receiver.id),
+    )
+
+    s = await settlement_service.create_settlement(
+        session,
+        group.id,
+        test_user.id,
+        GroupSettlementCreate(
+            from_member_id=me.id,
+            to_member_id=bob.id,
+            amount=Decimal("10.00"),
+            currency="USD",
+            date=date.today(),
+            account_id=payer_account.id,
+        ),
+    )
+    assert s is not None
+    assert s.receiver_transaction_id is None
+
+
+@pytest.mark.asyncio
+async def test_receiver_credit_lands_on_owner_when_self_member_unlinked(
+    session: AsyncSession, test_user
+):
+    """When the to_member is the owner's self-member with no
+    linked_user_id, the service falls back to group.user_id — the
+    credit lands on the owner's checking account."""
+    owner_account = await _make_account(session, test_user.id)
+    group = await group_service.create_group(
+        session, test_user.id, GroupCreate(name="SelfFallback")
+    )
+    owner_self = await group_service.create_member(
+        session, group.id, test_user.id, GroupMemberCreate(name="Me", is_self=True)
+    )
+    friend = await group_service.create_member(
+        session, group.id, test_user.id, GroupMemberCreate(name="Friend")
+    )
+
+    # Friend pays the owner back. Caller is the owner (allowed to record
+    # on any from_member). No account_id — friend is a shadow, no real
+    # account to debit. Receiver fallback should still kick in.
+    s = await settlement_service.create_settlement(
+        session,
+        group.id,
+        test_user.id,
+        GroupSettlementCreate(
+            from_member_id=friend.id,
+            to_member_id=owner_self.id,
+            amount=Decimal("20.00"),
+            currency="USD",
+            date=date.today(),
+        ),
+    )
+    assert s is not None
+    assert s.receiver_transaction_id is not None
+
+    receiver_tx = await session.get(Transaction, s.receiver_transaction_id)
+    assert receiver_tx is not None
+    assert receiver_tx.user_id == test_user.id
+    assert receiver_tx.account_id == owner_account.id
+    assert receiver_tx.type == "credit"
+    assert receiver_tx.amount == Decimal("20.00")
