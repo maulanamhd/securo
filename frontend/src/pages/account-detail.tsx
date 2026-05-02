@@ -447,15 +447,16 @@ export default function AccountDetailPage() {
         const prev = i > 0 ? billsAsc[i - 1] : null
         cycles.push({ ...rangeForBill(b, prev), bill: b })
       }
-      // The current in-progress cycle (no bill yet) appears as a trailing
-      // bar when today is past the most recent bill's due_date. Use the
-      // cycle-math range [prev_close, next_close-1] so a tx dated on the
-      // previous close (which belongs to the NEXT cycle per Brazilian
-      // convention) shows up. The backend's `bill_id IS NULL` filter in the
-      // cycle-math fallback prevents already-billed txs from leaking in.
-      const newest = billsAsc[billsAsc.length - 1]
-      const today = format(new Date(), 'yyyy-MM-dd')
-      if (today > newest.due_date && account.statement_close_day) {
+      // The current in-progress cycle (no bill yet) is ALWAYS a trailing
+      // bar when the account has any bills — charges accrue to the next
+      // bill the moment the previous one closes, regardless of whether
+      // its due date has passed. Skipping it hides the user's currently-
+      // accumulating spend from the strip until ~10 days into the cycle.
+      // Use the cycle-math range [prev_close, next_close-1] so a tx dated
+      // on the previous close (which belongs to the NEXT cycle per
+      // Brazilian convention) shows up. The backend's `bill_id IS NULL`
+      // filter prevents already-billed txs from leaking in.
+      if (account.statement_close_day) {
         cycles.push(creditCardCycleBoundaries(account.statement_close_day, new Date()))
       }
       return cycles.slice(-6)
