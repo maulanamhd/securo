@@ -953,6 +953,86 @@ class TestEffectiveBillDateFiltersList:
         assert billed.id in {t.id for t in txs_unfiltered}
 
     @pytest.mark.asyncio
+    async def test_bill_view_filter_is_mode_independent(
+        self, session, test_user, cc_account
+    ):
+        """Bill view = bank-truth: a 4/30 charge with effective_date 6/10
+        must show in the in-progress June cycle in BOTH cash and accrual
+        modes. The cycle is the bank's bill, not the user's report; the
+        accounting mode only affects balance/reports, not what's in a bill.
+
+        Without this carve-out, accrual mode filtered the in-progress
+        cycle by effective_date against a close-day window, hiding the
+        tx (issue #92, abdalanervoso's accrual report).
+        """
+        from app.services.transaction_service import get_transactions
+
+        pending = await _make_tx(
+            session, test_user.id, cc_account.id,
+            date(2026, 4, 30), Decimal("91.51"),
+            effective_date=date(2026, 6, 10),
+            source="sync",
+        )
+        pending.status = "pending"
+        await session.commit()
+
+        for mode in ("cash", "accrual"):
+            txs, _ = await get_transactions(
+                session, test_user.id, account_id=cc_account.id,
+                from_date=date(2026, 4, 30), to_date=date(2026, 5, 29),
+                accounting_mode=mode,
+                unbilled_only=True,
+            )
+            assert pending.id in {t.id for t in txs}, (
+                f"in-progress bill view must include the tx in {mode} mode"
+            )
+
+    @pytest.mark.asyncio
+    async def test_global_list_still_mode_aware_outside_bill_view(
+        self, session, test_user, cc_account
+    ):
+        """Regression guard: outside the bill view (no bill_id, no
+        unbilled_only), the global list MUST still respect accounting
+        mode. Accrual users on /transactions filter by effective_date so
+        a 4/30 charge effective 6/10 appears in the JUNE date window
+        (when cash hits), not the April one.
+        """
+        from app.services.transaction_service import get_transactions
+
+        tx = await _make_tx(
+            session, test_user.id, cc_account.id,
+            date(2026, 4, 30), Decimal("91.51"),
+            effective_date=date(2026, 6, 10),
+            source="sync",
+        )
+        await session.commit()
+
+        # Cash mode: filtered by purchase date → in April window
+        txs_cash_apr, _ = await get_transactions(
+            session, test_user.id, account_id=cc_account.id,
+            from_date=date(2026, 4, 1), to_date=date(2026, 4, 30),
+            accounting_mode="cash",
+        )
+        assert tx.id in {t.id for t in txs_cash_apr}
+
+        # Accrual mode: filtered by effective_date → NOT in April window,
+        # but IS in June window. This is the existing mode-aware semantic
+        # callers outside the bill view rely on.
+        txs_accrual_apr, _ = await get_transactions(
+            session, test_user.id, account_id=cc_account.id,
+            from_date=date(2026, 4, 1), to_date=date(2026, 4, 30),
+            accounting_mode="accrual",
+        )
+        assert tx.id not in {t.id for t in txs_accrual_apr}
+
+        txs_accrual_jun, _ = await get_transactions(
+            session, test_user.id, account_id=cc_account.id,
+            from_date=date(2026, 6, 1), to_date=date(2026, 6, 30),
+            accounting_mode="accrual",
+        )
+        assert tx.id in {t.id for t in txs_accrual_jun}
+
+    @pytest.mark.asyncio
     async def test_pending_sync_excluded_from_past_bill_when_effective_date_points_elsewhere(
         self, session, test_user, cc_account
     ):

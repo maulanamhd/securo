@@ -76,6 +76,20 @@ async def get_transactions(
         Transaction.effective_bill_date,
         Transaction.effective_date if accounting_mode == "accrual" else Transaction.date,
     )
+    # CC bill-view date column: when the caller asks "what's in this bill?"
+    # (bill_id passed, or in-progress cycle via unbilled_only), the answer
+    # is bank-truth — the charges that fell in the cycle by purchase date —
+    # independent of the user's cash/accrual reporting preference. Without
+    # this carve-out, accrual mode would hide a 4/30 charge whose
+    # effective_date points at the next bill's due date because the cycle
+    # window [prev_close, this_close-1] doesn't contain the future
+    # effective_date (issue #92, abdalanervoso's accrual case).
+    bill_view_date_col = func.coalesce(
+        Transaction.effective_bill_date,
+        Transaction.date,
+    )
+    in_bill_view = bill_id is not None or unbilled_only
+    filter_date_col = bill_view_date_col if in_bill_view else date_col
     # Base query: user's own transactions (manual or via account)
     base_query = (
         select(Transaction)
@@ -158,9 +172,9 @@ async def get_transactions(
                 )),
             ]
             if from_date:
-                unlinked_clauses.append(date_col >= from_date)
+                unlinked_clauses.append(filter_date_col >= from_date)
             if to_date:
-                unlinked_clauses.append(date_col <= to_date)
+                unlinked_clauses.append(filter_date_col <= to_date)
             bill_predicates.append(_and(*unlinked_clauses))
         base_query = base_query.where(or_(*bill_predicates))
     else:
@@ -173,9 +187,9 @@ async def get_transactions(
         if unbilled_only:
             base_query = base_query.where(Transaction.bill_id.is_(None))
         if from_date:
-            base_query = base_query.where(date_col >= from_date)
+            base_query = base_query.where(filter_date_col >= from_date)
         if to_date:
-            base_query = base_query.where(date_col <= to_date)
+            base_query = base_query.where(filter_date_col <= to_date)
     if search:
         term = f"%{search}%"
         base_query = base_query.where(
@@ -207,8 +221,11 @@ async def get_transactions(
     count_query = select(func.count()).select_from(base_query.subquery())
     total = await session.scalar(count_query)
 
-    # Apply ordering (and pagination unless skipped)
-    query = base_query.order_by(date_col.desc(), Transaction.created_at.desc())
+    # Apply ordering (and pagination unless skipped). Bill-view callers
+    # order by purchase date so the in-cycle list matches the bank's own
+    # statement ordering regardless of accounting mode.
+    order_col = bill_view_date_col if in_bill_view else date_col
+    query = base_query.order_by(order_col.desc(), Transaction.created_at.desc())
     if not skip_pagination:
         query = query.offset((page - 1) * limit).limit(limit)
 
