@@ -295,12 +295,13 @@ export default function AccountDetailPage() {
         return
       }
       // Stepping forward past the newest bill = the in-progress cycle.
-      // Start strictly after the newest bill so synth charges don't leak in.
+      // Use the full cycle-math range [prev_close, next_close-1] so a tx
+      // dated on the previous close (Brazilian convention: belongs to the
+      // NEXT cycle) shows up. The backend filters bill_id IS NULL in this
+      // path so already-billed txs don't double-count against the bar.
       if (newIdx === billsAsc.length && account?.statement_close_day) {
-        const newest = billsAsc[billsAsc.length - 1]
         const cm = creditCardCycleBoundaries(account.statement_close_day, new Date())
-        const start = format(addDays(parseISO(newest.due_date + 'T00:00:00'), 1), 'yyyy-MM-dd')
-        setFilterFrom(start)
+        setFilterFrom(cm.start)
         setFilterTo(cm.end)
         return
       }
@@ -345,6 +346,11 @@ export default function AccountDetailPage() {
     if (!billsAsc.length) return null
     return billsAsc.find(b => b.due_date === filterTo) ?? null
   }, [billsAsc, filterTo])
+  // True when the user is on the trailing in-progress cycle (CC has bills,
+  // but the current view doesn't match any of them). Backend uses this to
+  // exclude already-billed txs from the cycle window so they don't double-
+  // count against the in-progress bar/total.
+  const isInProgressCycle = !activeBill && billsAsc.length > 0
 
   useEffect(() => {
     if (!account || filterTouched.current) return
@@ -366,14 +372,14 @@ export default function AccountDetailPage() {
           setFilterTo(end)
           return
         }
-        // Today is past the newest bill — show the in-progress cycle starting
-        // strictly after that bill so synthetic charges don't leak in.
+        // Today is past the newest bill — use cycle-math range
+        // [prev_close, next_close-1] so the prev-close-day tx (Brazilian:
+        // belongs to next cycle) is in window. Backend's bill_id IS NULL
+        // filter in the cycle-math fallback keeps already-billed txs out.
         if (account.statement_close_day) {
-          const newest = billsAsc[billsAsc.length - 1]
-          const cm = creditCardCycleBoundaries(account.statement_close_day, new Date())
-          const start = format(addDays(parseISO(newest.due_date + 'T00:00:00'), 1), 'yyyy-MM-dd')
+          const { start, end } = creditCardCycleBoundaries(account.statement_close_day, new Date())
           setFilterFrom(start)
-          setFilterTo(cm.end)
+          setFilterTo(end)
           return
         }
       }
@@ -393,8 +399,21 @@ export default function AccountDetailPage() {
   })
 
   const { data: summary, isLoading: summaryLoading } = useQuery({
-    queryKey: ['accounts', id, 'summary', filterFrom, filterTo],
-    queryFn: () => accounts.summary(id!, filterFrom || undefined, filterTo || undefined),
+    // When a real bill anchors the active cycle, send bill_id AND the cycle
+    // window. Backend ORs them so both bill_id-linked txs (bank truth) and
+    // unlinked txs in the window (manual recurring, CSV imports) count.
+    // For the in-progress cycle (no bill match), unbilled_only excludes
+    // txs already linked to a closed bill (anti-double-count).
+    queryKey: activeBill
+      ? ['accounts', id, 'summary', { bill_id: activeBill.id, from: filterFrom, to: filterTo }]
+      : ['accounts', id, 'summary', filterFrom, filterTo, { unbilled_only: isInProgressCycle }],
+    queryFn: () => accounts.summary(
+      id!,
+      filterFrom || undefined,
+      filterTo || undefined,
+      activeBill?.id,
+      isInProgressCycle || undefined,
+    ),
     enabled: !!id,
   })
 
@@ -428,17 +447,17 @@ export default function AccountDetailPage() {
         const prev = i > 0 ? billsAsc[i - 1] : null
         cycles.push({ ...rangeForBill(b, prev), bill: b })
       }
-      // The current in-progress cycle (no bill yet) appears as a trailing bar
-      // when today is past the most recent bill's due_date. Anchor its start
-      // strictly AFTER the newest bill's due_date so finance-charge txs we
-      // synthesized for that bill (effective_date == bill.due_date) don't
-      // leak into the in-progress cycle.
-      const newest = billsAsc[billsAsc.length - 1]
-      const today = format(new Date(), 'yyyy-MM-dd')
-      if (today > newest.due_date && account.statement_close_day) {
-        const cm = creditCardCycleBoundaries(account.statement_close_day, new Date())
-        const afterNewest = format(addDays(parseISO(newest.due_date + 'T00:00:00'), 1), 'yyyy-MM-dd')
-        cycles.push({ start: afterNewest, end: cm.end })
+      // The current in-progress cycle (no bill yet) is ALWAYS a trailing
+      // bar when the account has any bills — charges accrue to the next
+      // bill the moment the previous one closes, regardless of whether
+      // its due date has passed. Skipping it hides the user's currently-
+      // accumulating spend from the strip until ~10 days into the cycle.
+      // Use the cycle-math range [prev_close, next_close-1] so a tx dated
+      // on the previous close (which belongs to the NEXT cycle per
+      // Brazilian convention) shows up. The backend's `bill_id IS NULL`
+      // filter prevents already-billed txs from leaking in.
+      if (account.statement_close_day) {
+        cycles.push(creditCardCycleBoundaries(account.statement_close_day, new Date()))
       }
       return cycles.slice(-6)
     }
@@ -456,15 +475,19 @@ export default function AccountDetailPage() {
 
   const timelineQueries = useQueries({
     queries: timelineCycles.map(c => ({
-      queryKey: ['accounts', id, 'summary', c.start, c.end],
-      queryFn: () => accounts.summary(id!, c.start, c.end),
-      // Skip the per-cycle summary fetch when the cycle is anchored on a real
-      // bill — bill.total_amount is the bank's own number (stable for closed
-      // cycles, slightly stale for the in-progress one but fine for a small
-      // historical bar). The summary endpoint here filters by Transaction.date
-      // anyway, which doesn't agree with bill_id bucketing for txs Pluggy
-      // rolled outside the nominal cycle range.
-      enabled: !!id && !c.bill,
+      // Bill-anchored cycles send bill_id AND the cycle window so the
+      // backend includes both Pluggy-linked txs and any unlinked txs
+      // (manual / recurring) the user placed in this cycle. The trailing
+      // in-progress cycle (no bill) sets unbilled_only so prior-bill txs
+      // that fall in the window aren't double-counted in the bar.
+      queryKey: c.bill
+        ? ['accounts', id, 'summary', { bill_id: c.bill.id, from: c.start, to: c.end }]
+        : ['accounts', id, 'summary', c.start, c.end, { unbilled_only: billsAsc.length > 0 }],
+      queryFn: () => accounts.summary(
+        id!, c.start, c.end, c.bill?.id,
+        c.bill ? undefined : (billsAsc.length > 0 || undefined),
+      ),
+      enabled: !!id,
     })),
   })
 
@@ -475,15 +498,20 @@ export default function AccountDetailPage() {
   })
 
   const { data: txData, isLoading: txLoading } = useQuery({
-    queryKey: ['transactions', { account_id: id, bill_id: activeBill?.id, from: filterFrom, to: filterTo, limit: 500, include_opening_balance: true }],
+    queryKey: ['transactions', { account_id: id, bill_id: activeBill?.id, from: filterFrom, to: filterTo, limit: 500, include_opening_balance: true, unbilled_only: isInProgressCycle }],
     queryFn: () => transactions.list({
       account_id: id,
-      // When the active cycle is a real bill, filter by bill_id (Pluggy's
-      // truth) instead of date range — handles charges the bank rolled into
-      // a bill whose nominal range doesn't include the tx date. Issue #92.
+      // When the active cycle is a real bill, prefer bill_id (Pluggy's
+      // truth — picks up charges the bank rolled outside the nominal date
+      // range) AND keep from/to so manual / non-bill-linked txs (recurring
+      // fills, CSV imports) bucketed into this cycle still show up.
       bill_id: activeBill?.id,
-      from: activeBill ? undefined : (filterFrom || undefined),
-      to: activeBill ? undefined : (filterTo || undefined),
+      // For the in-progress cycle (CC has bills, but no bill matches the
+      // current view), exclude already-billed txs so the bar/list only
+      // shows what's accumulating toward the next bill.
+      unbilled_only: isInProgressCycle || undefined,
+      from: filterFrom || undefined,
+      to: filterTo || undefined,
       limit: 500,
       include_opening_balance: true,
     }),
@@ -644,22 +672,20 @@ export default function AccountDetailPage() {
     if (!txData?.items) return []
 
     if (isCreditCard) {
-      // Match the cycle spending chart: cumulative sum of debits (excluding
-      // transfers and opening balance), computed oldest → newest, then
-      // displayed by reversing the array (NOT a fresh descending sort).
-      // The reverse keeps each row showing its true per-tx cumulative AND
-      // makes within-same-day rows read monotonically top-down — the
-      // last-processed within a day lands at the top of that day's group.
-      // A descending sort would re-tie-break and put the smallest-cumulative
-      // row at top instead, producing a non-monotonic visual.
+      // Cycle running total: debits add, refund credits subtract (net
+      // matches the bank's bill total). Excludes opening_balance and any
+      // transfer-paired tx (bill payments — those zero out separately).
+      // Computed oldest → newest, then reversed (not re-sorted) so
+      // same-day rows read monotonically top-down.
       const ascending = [...txData.items].sort(
         (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
       )
       let running = 0
       const withBalance = ascending.map((tx) => {
-        if (tx.type === 'debit' && tx.source !== 'opening_balance' && !tx.transfer_pair_id) {
+        if (tx.source !== 'opening_balance' && !tx.transfer_pair_id) {
           const amt = usePrimary && tx.amount_primary != null ? Number(tx.amount_primary) : Number(tx.amount)
-          running += amt
+          if (tx.type === 'debit') running += amt
+          else if (tx.type === 'credit') running -= amt
         }
         return { ...tx, runningBalance: running }
       })
@@ -910,36 +936,17 @@ export default function AccountDetailPage() {
       {/* Bill timeline (last 6 cycles) — only for CC with cycle metadata */}
       {isCreditCard && timelineCycles.length > 0 && (() => {
         const dfLocale = i18n.language === 'pt-BR' ? ptBR : enUS
-        // Live debit sum for the active bill, computed from the bill_id-filtered
-      // tx list so it matches the user's bank app (bill.total_amount can lag
-      // any charges added since the last sync).
-      const liveActiveBillDebits = activeBill && txData?.items
-        ? txData.items
-            .filter(tx => tx.type === 'debit' && tx.source !== 'opening_balance' && !tx.transfer_pair_id)
-            .reduce((sum, tx) => {
-              const amt = usePrimary && tx.amount_primary != null
-                ? Number(tx.amount_primary)
-                : Number(tx.amount)
-              return sum + amt
-            }, 0)
-        : null
-      const totals = timelineQueries.map((q, i) => {
+        const totals = timelineQueries.map((q, i) => {
           const c = timelineCycles[i]
-          // Use live debit sum for the active bill so the bar matches the
-          // stat card. Stable bill snapshot for non-active bills (historical
-          // bars). Summary fallback for cycles without a bill.
-          let total: number
-          if (c.bill && activeBill && c.bill.id === activeBill.id && liveActiveBillDebits != null) {
-            total = liveActiveBillDebits
-          } else if (c.bill) {
-            total = Number(c.bill.total_amount)
-          } else {
-            total = Number(q.data?.monthly_expenses ?? 0)
-          }
+          // Single source of truth: live debit sum from the summary endpoint,
+          // filtered by bill_id when the cycle has a bill (handles dynamic
+          // close days) or by [start, end] otherwise. Same number whether
+          // the bar is active or not — clicking doesn't shift the value.
+          const total = Number(q.data?.monthly_expenses ?? 0)
           return {
             ...c,
             total,
-            loading: !c.bill && q.isLoading,
+            loading: q.isLoading,
           }
         })
         const max = Math.max(1, ...totals.map(c => c.total))
@@ -995,20 +1002,9 @@ export default function AccountDetailPage() {
         // Total da fatura. When a real bill is active, sum debits from the
         // bill_id-filtered tx list (matches the bank app — bills' total_amount
         // can lag any charges added since the last sync). Otherwise use the
-        // summary endpoint's monthly_expenses for the cycle-math range.
-        const liveBillDebits = activeBill && txData?.items
-          ? txData.items
-              .filter(tx => tx.type === 'debit' && tx.source !== 'opening_balance' && !tx.transfer_pair_id)
-              .reduce((sum, tx) => {
-                const amt = usePrimary && tx.amount_primary != null
-                  ? Number(tx.amount_primary)
-                  : Number(tx.amount)
-                return sum + amt
-              }, 0)
-          : null
-        const billTotal = liveBillDebits != null
-          ? liveBillDebits
-          : (showPrimary ? summary?.monthly_expenses_primary : undefined) ?? summary?.monthly_expenses ?? 0
+        // summary endpoint's monthly_expenses now nets refund credits against
+        // debits for CC accounts (matches the bank's bill total).
+        const billTotal = (showPrimary ? summary?.monthly_expenses_primary : undefined) ?? summary?.monthly_expenses ?? 0
         // "Default cycle" = the bill the user is here to pay (next due). The
         // AGORA tag on Limite disponível only shows when viewing a different cycle.
         const isDefaultCycle =

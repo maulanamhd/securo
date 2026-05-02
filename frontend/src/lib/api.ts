@@ -229,8 +229,8 @@ export const accounts = {
   delete: async (id: string): Promise<void> => {
     await api.delete(`/accounts/${id}`)
   },
-  summary: async (id: string, from?: string, to?: string): Promise<AccountSummary> => {
-    const { data } = await api.get(`/accounts/${id}/summary`, { params: { from, to } })
+  summary: async (id: string, from?: string, to?: string, billId?: string, unbilledOnly?: boolean): Promise<AccountSummary> => {
+    const { data } = await api.get(`/accounts/${id}/summary`, { params: { from, to, bill_id: billId, unbilled_only: unbilledOnly || undefined } })
     return data
   },
   balanceHistory: async (id: string, from?: string, to?: string): Promise<{ date: string; balance: number; balance_primary?: number }[]> => {
@@ -265,6 +265,7 @@ export const transactions = {
     to?: string
     bill_id?: string
     group_id?: string
+    unbilled_only?: boolean
     q?: string
     page?: number
     limit?: number
@@ -354,8 +355,26 @@ export const transactions = {
     const { data } = await api.post('/transactions/import/preview', formData)
     return data
   },
-  import: async (account_id: string, transactions: Transaction[], filename: string, detected_format: string): Promise<{ imported: number; skipped: number; import_log_id: string }> => {
-    const { data } = await api.post('/transactions/import', { account_id, transactions, filename, detected_format })
+  import: async (
+    account_id: string,
+    transactions: Transaction[],
+    filename: string,
+    detected_format: string,
+    options?: { detect_duplicates?: boolean },
+  ): Promise<{ imported: number; skipped: number; import_log_id: string }> => {
+    const payload: {
+      account_id: string
+      transactions: Transaction[]
+      filename: string
+      detected_format: string
+      detect_duplicates?: boolean
+    } = { account_id, transactions, filename, detected_format }
+
+    if (typeof options?.detect_duplicates === 'boolean') {
+      payload.detect_duplicates = options.detect_duplicates
+    }
+
+    const { data } = await api.post('/transactions/import', payload)
     return data
   },
   export: async (params?: {
