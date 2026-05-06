@@ -531,6 +531,26 @@ async def test_install_rule_pack_reports_unresolved_when_categories_missing(
 
 
 @pytest.mark.asyncio
+async def test_install_rule_pack_creates_missing_categories_when_opted_in(
+    session: AsyncSession, test_user
+):
+    # Same degenerate user, but they tick the "create missing categories"
+    # checkbox in the modal. Pack must seed the categories it needs and
+    # then install the full rule set.
+    result = await install_rule_pack(
+        session,
+        test_user.id,
+        "BR",
+        lang="pt-BR",
+        create_missing_categories=True,
+    )
+
+    assert len(result.rules) == len(RULE_PACKS["BR"]["rules"])
+    assert result.unresolved == 0
+    assert result.categories_created > 0
+
+
+@pytest.mark.asyncio
 async def test_install_rule_pack_unknown_returns_empty(session: AsyncSession, test_user):
     result = await install_rule_pack(session, test_user.id, "ZZ")
     assert result.rules == []
