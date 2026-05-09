@@ -1,8 +1,6 @@
 // pages/transactions-mobile-view.tsx
 import { useState, useMemo } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { CategoryIcon } from '@/components/category-icon'
 import { ArrowLeftRight, Plus, Paperclip, Users } from 'lucide-react'
@@ -15,31 +13,19 @@ interface TransactionsMobileViewProps {
   onTransactionClick: (tx: Transaction) => void
   onAddClick: () => void
   onTransferClick: () => void
-  privacyMode?: boolean
   mask?: (value: string) => string
   locale?: string
+  userCurrency?: string
   groupNameById?: Map<string, string>
   recurringDescriptions?: Set<string>
   getAccountName?: (account: any) => string
 }
 
-interface GroupedTransactions {
-  date: string
-  transactions: Transaction[]
-}
 
 function formatCurrency(value: number, currency = 'USD', locale = 'en-US') {
   return new Intl.NumberFormat(locale, { style: 'currency', currency }).format(value)
 }
 
-function formatDate(dateString: string, locale = 'en-US'): string {
-  const date = new Date(dateString + 'T00:00:00')
-  return date.toLocaleDateString(locale, {
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-  })
-}
 
 function formatDateGroup(dateString: string, locale = 'en-US'): string {
   const date = new Date(dateString + 'T00:00:00')
@@ -68,7 +54,6 @@ export function TransactionsMobileView({
   onTransactionClick,
   onAddClick,
   onTransferClick,
-  privacyMode = false,
   mask = (v) => v,
   locale = 'en-US',
   userCurrency = 'USD',  // Default USD
@@ -198,7 +183,6 @@ function MobileDateGroup({
   recurringDescriptions,
   accounts,
   getAccountName,
-  t,
 }: {
   date: string
   transactions: Transaction[]
