@@ -12,6 +12,7 @@ import { cn } from '@/lib/utils'
 import type { AxiosError } from 'axios'
 
 const currencies = [
+  { code: 'IDR', flag: '\u{1F1EE}\u{1F1E9}', symbol: 'Rp' },
   { code: 'USD', flag: '\u{1F1FA}\u{1F1F8}', symbol: '$' },
   { code: 'EUR', flag: '\u{1F1EA}\u{1F1FA}', symbol: '\u20AC' },
   { code: 'GBP', flag: '\u{1F1EC}\u{1F1E7}', symbol: '\u00A3' },
