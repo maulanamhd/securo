@@ -132,8 +132,8 @@ export function TransactionDialog({
   return (
     <Dialog open={open} onOpenChange={onClose}>
       <DialogContent className={cn(
-        'transition-[max-width] duration-300',
-        hasPreview ? 'sm:max-w-5xl max-w-2xl' : 'sm:max-w-2xl max-w-2xl'
+        'transition-[max-width] duration-300 overflow-hidden',
+        hasPreview ? 'sm:max-w-5xl max-w-2xl' : 'sm:max-w-2xl max-w-[calc(100vw-2rem)]'
       )}>
         <div className={isEditing ? 'sm:flex sm:gap-0 sm:h-[80vh]' : ''}>
           {/* Left column: form */}
@@ -215,7 +215,7 @@ export function TransactionDialog({
 
         {/* Mobile: full-screen overlay */}
         {hasPreview && (
-          <div className="sm:hidden fixed inset-0 z-[100] bg-background flex flex-col animate-in slide-in-from-right duration-200">
+          <div className="sm:hidden fixed inset-0 z-[100] bg-background flex flex-col animate-in slide-in-from-right duration-200 overflow-hidden">
             <div className="flex-1 overflow-hidden">
               {preview.contentType === 'application/pdf' ? (
                 <iframe
@@ -504,12 +504,12 @@ function TransactionForm({
         onSave(txData, recurringData, isCreating && pendingFiles.length > 0 ? pendingFiles : undefined, action)
       }}
       className={cn(
-        'flex flex-col',
+        'flex flex-col overflow-hidden',
         !isCreating ? 'flex-1 min-h-0' : 'max-h-[85vh]',
         hasPreview && 'mt-4'
       )}
     >
-      <div className="space-y-4 overflow-y-auto flex-1 min-h-0 pb-2">
+      <div className="space-y-4 overflow-y-auto overflow-x-hidden flex-1 min-h-0 pb-2">
       {error && (
         <div className="p-3 text-sm text-destructive bg-destructive/10 rounded-md">
           {error}
@@ -566,7 +566,7 @@ function TransactionForm({
           <p className="text-xs text-muted-foreground">{transaction.payee}</p>
         )}
       </div>
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
         <div className="space-y-2">
           <Label>{t('transactions.amount')}</Label>
           <Input
@@ -613,7 +613,7 @@ function TransactionForm({
             <span className="text-sm font-medium">{t('transactions.conversion')}</span>
             <span className="text-xs text-muted-foreground ml-2">({t('transactions.conversionHint')})</span>
           </div>
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="space-y-1">
               <Label className="text-xs">{t('transactions.convertedAmount', { currency: userCurrency })}</Label>
               <Input
@@ -637,7 +637,7 @@ function TransactionForm({
           </div>
         </div>
       )}
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div className="space-y-2">
           <Label>{t('transactions.type')}</Label>
           <select
@@ -664,7 +664,7 @@ function TransactionForm({
           </select>
         </div>
       </div>
-      <div className={cn("grid gap-4", isSynced ? "grid-cols-1" : "grid-cols-2")}>
+      <div className={cn("grid gap-4", isSynced ? "grid-cols-1" : "grid-cols-1 sm:grid-cols-2")}>
         <div className="space-y-2">
           <Label>{t('payees.payee')}</Label>
           <select
@@ -921,7 +921,7 @@ function PendingAttachmentsSection({
 
       {hasFiles ? (
         <>
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
             {files.map((file, index) => {
               const isImg = file.type.startsWith('image/')
               const isPdf = file.type === 'application/pdf'
