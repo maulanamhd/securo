@@ -18,7 +18,7 @@ interface TransactionsMobileViewProps {
   userCurrency?: string
   groupNameById?: Map<string, string>
   recurringDescriptions?: Set<string>
-  getAccountName?: (account: any) => string
+  getAccountName?: (account: { name: string; display_name?: string | null; id?: string }) => string
 }
 
 
@@ -193,8 +193,8 @@ function MobileDateGroup({
   groupNameById?: Map<string, string>
   recurringDescriptions?: Set<string>
   accounts: Array<{ id: string; name: string; display_name?: string | null }>
-  getAccountName?: (account: any) => string
-  t: any
+  getAccountName?: (account: { name: string; display_name?: string | null; id?: string }) => string
+  t: (key: string, options?: Record<string, unknown>) => string
 }) {
   const [isExpanded, setIsExpanded] = useState(true)
 
@@ -277,7 +277,7 @@ function MobileTransactionCard({
   groupNameById?: Map<string, string>
   isRecurring?: boolean
   accounts: Array<{ id: string; name: string; display_name?: string | null }>
-  getAccountName?: (account: any) => string
+  getAccountName?: (account: { name: string; display_name?: string | null; id?: string }) => string
 }) {
   const displayAmount = tx.is_shared && tx.viewer_share != null
     ? Number(tx.viewer_share)
