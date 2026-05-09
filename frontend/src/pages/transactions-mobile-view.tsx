@@ -18,6 +18,7 @@ interface TransactionsMobileViewProps {
   userCurrency?: string
   groupNameById?: Map<string, string>
   recurringDescriptions?: Set<string>
+  accounts: Array<{ id: string; name: string; display_name?: string | null }>
   getAccountName?: (account: { name: string; display_name?: string | null; id?: string }) => string
 }
 
