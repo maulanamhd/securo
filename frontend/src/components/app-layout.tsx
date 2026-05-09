@@ -234,6 +234,37 @@ export function AppLayout() {
           />
         )}
 
+        {/* Mobile Bottom Navigation */}
+        <nav className="fixed bottom-0 left-0 right-0 z-40 bg-sidebar border-t border-sidebar-border lg:hidden">
+          <div className="flex items-center justify-around px-2 py-2">
+            {[
+              { path: '/', icon: LayoutDashboard, key: 'dashboard' },
+              { path: '/transactions', icon: ArrowLeftRight, key: 'transactions' },
+              { path: '/reports', icon: BarChart3, key: 'reports' },
+              { path: '/accounts', icon: Building2, key: 'accounts' },
+            ].map(({ path, icon: Icon, key }) => {
+              const isActive = path === '/'
+                ? location.pathname === '/'
+                : location.pathname.startsWith(path)
+              return (
+                <Link
+                  key={key}
+                  to={path}
+                  className={cn(
+                    'flex flex-col items-center gap-1 px-4 py-1 rounded-lg transition-colors',
+                    isActive
+                      ? 'text-primary'
+                      : 'text-sidebar-muted hover:text-sidebar-foreground'
+                  )}
+                >
+                  <Icon size={22} />
+                  <span className="text-[10px] font-medium">{t(`nav.${key}`)}</span>
+                </Link>
+              )
+            })}
+          </div>
+        </nav>
+
         {/* Sidebar */}
         <aside
           className={cn(
@@ -548,7 +579,7 @@ export function AppLayout() {
 
         {/* Main content */}
         <main className="flex-1 min-h-screen overflow-x-hidden lg:ml-60">
-          <div className="p-6 max-w-7xl mx-auto">
+          <div className="p-6 max-w-7xl mx-auto pb-24 lg:pb-6">
             <Outlet />
           </div>
         </main>
