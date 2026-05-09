@@ -7,6 +7,9 @@ import { transactions, categories as categoriesApi, accounts as accountsApi, rec
 import { invalidateFinancialQueries } from '@/lib/invalidate-queries'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
+import { useMediaQuery } from '@/hooks/use-media-query'
+import { TransactionsMobileView } from '@/pages/transactions-mobile-view'
+
 import {
   Dialog,
   DialogContent,
@@ -86,6 +89,7 @@ export default function TransactionsPage() {
   const [filterGroupId, setFilterGroupId] = useState<string>(searchParams.get('group_id') ?? '')
   const [filterType, setFilterType] = useState<string>(searchParams.get('type') ?? '')
   const [tagFilters, setTagFilters] = useState<string[]>([])
+  const isMobile = useMediaQuery('(max-width: 768px)')
 
   // When the page is opened with a `group_id`, fetch its name so the
   // active-filter chip is recognizable rather than a raw uuid.
@@ -265,6 +269,13 @@ export default function TransactionsPage() {
     queryKey: ['recurring'],
     queryFn: recurring.list,
   })
+
+  const recurringDescriptions = useMemo(() => {
+    if (!recurringList) return new Set<string>()
+    return new Set(
+      recurringList.map(r => `${r.description}_${r.type}`)
+    )
+  }, [recurringList])
 
   const { data: accountingModeData } = useQuery({
     queryKey: ['admin', 'accounting-mode'],
@@ -1018,77 +1029,105 @@ export default function TransactionsPage() {
       )}
 
       {/* Table */}
-      <div className="bg-card rounded-xl border border-border shadow-sm overflow-hidden mb-4">
-        {isLoading ? (
-          <div className="p-6 space-y-3">
-            {Array.from({ length: 5 }).map((_, i) => (
-              <Skeleton key={i} className="h-14 w-full" />
-            ))}
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-          <Table style={{ tableLayout: 'fixed' }}>
-            <TableHeader>
-              <TableRow className="border-b border-border hover:bg-transparent">
-                <TableHead style={{ width: 40, minWidth: 40 }} className="py-3 pl-4 pr-0">
-                  <input
-                    type="checkbox"
-                    checked={allSelected}
-                    ref={(el) => { if (el) el.indeterminate = someSelected }}
-                    onChange={toggleSelectAll}
-                    className="h-4 w-4 rounded border-border accent-primary cursor-pointer"
-                  />
-                </TableHead>
-                {grid.visibleColumns.map(renderHeaderCell)}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {filteredItems.map((tx) => (
-                <TableRow
-                  key={tx.id}
-                  ref={tx.id === highlightId ? highlightedRowRef : undefined}
-                  className={`hover:bg-muted border-b border-border last:border-0 ${
-                    selectedIds.has(tx.id) ? 'bg-primary/5' : ''
-                  } ${tx.is_shared ? 'cursor-default' : 'cursor-pointer'}`}
-                  onClick={() => {
-                    if (tx.is_shared) {
-                      // Owned by another user — view in the group context instead.
-                      if (tx.group_id) navigate(`/groups/${tx.group_id}`)
-                      return
-                    }
-                    setEditingTx(tx)
-                    setDialogOpen(true)
-                  }}
-                >
-                  <TableCell style={{ width: 40, minWidth: 40 }} className="py-2.5 pl-4 pr-0">
-                    {/* Bulk operations are scoped to user.id so they
-                        silently skip shared rows — hide the checkbox
-                        on those to avoid the dead-end UX. */}
-                    {!tx.is_shared && (
-                      <input
-                        type="checkbox"
-                        checked={selectedIds.has(tx.id)}
-                        onChange={() => toggleSelect(tx.id)}
-                        onClick={(e) => e.stopPropagation()}
-                        className="h-4 w-4 rounded border-border accent-primary cursor-pointer"
-                      />
-                    )}
-                  </TableCell>
-                  {grid.visibleColumns.map(col => renderBodyCell(col, tx))}
-                </TableRow>
+      {isMobile ? (
+        <TransactionsMobileView
+          transactions={filteredItems}
+          isLoading={isLoading}
+          onTransactionClick={(tx) => {
+            if (tx.is_shared && tx.group_id) {
+              navigate(`/groups/${tx.group_id}`)
+              return
+            }
+            setEditingTx(tx)
+            setDialogOpen(true)
+          }}
+          onAddClick={() => {
+            setEditingTx(null)
+            setDuplicateDraft(null)
+            setDialogOpen(true)
+          }}
+          onTransferClick={() => setTransferDialogOpen(true)}
+          mask={mask}
+          locale={locale}
+          userCurrency={userCurrency}
+          groupNameById={groupNameById}
+          recurringDescriptions={recurringDescriptions}
+          accounts={accountsList ?? []}
+          getAccountName={getAccountName}
+        />
+      ) : (
+        <div className="bg-card rounded-xl border border-border shadow-sm overflow-hidden mb-4">
+          {isLoading ? (
+            <div className="p-6 space-y-3">
+              {Array.from({ length: 5 }).map((_, i) => (
+                <Skeleton key={i} className="h-14 w-full" />
               ))}
-              {filteredItems.length === 0 && (
-                <TableRow>
-                  <TableCell colSpan={grid.visibleColumns.length + 1} className="text-center py-16 text-muted-foreground">
-                    {t('transactions.noResults')}
-                  </TableCell>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+            <Table style={{ tableLayout: 'fixed' }}>
+              <TableHeader>
+                <TableRow className="border-b border-border hover:bg-transparent">
+                  <TableHead style={{ width: 40, minWidth: 40 }} className="py-3 pl-4 pr-0">
+                    <input
+                      type="checkbox"
+                      checked={allSelected}
+                      ref={(el) => { if (el) el.indeterminate = someSelected }}
+                      onChange={toggleSelectAll}
+                      className="h-4 w-4 rounded border-border accent-primary cursor-pointer"
+                    />
+                  </TableHead>
+                  {grid.visibleColumns.map(renderHeaderCell)}
                 </TableRow>
-              )}
-            </TableBody>
-          </Table>
-          </div>
-        )}
-      </div>
+              </TableHeader>
+              <TableBody>
+                {filteredItems.map((tx) => (
+                  <TableRow
+                    key={tx.id}
+                    ref={tx.id === highlightId ? highlightedRowRef : undefined}
+                    className={`hover:bg-muted border-b border-border last:border-0 ${
+                      selectedIds.has(tx.id) ? 'bg-primary/5' : ''
+                    } ${tx.is_shared ? 'cursor-default' : 'cursor-pointer'}`}
+                    onClick={() => {
+                      if (tx.is_shared) {
+                        // Owned by another user — view in the group context instead.
+                        if (tx.group_id) navigate(`/groups/${tx.group_id}`)
+                        return
+                      }
+                      setEditingTx(tx)
+                      setDialogOpen(true)
+                    }}
+                  >
+                    <TableCell style={{ width: 40, minWidth: 40 }} className="py-2.5 pl-4 pr-0">
+                      {/* Bulk operations are scoped to user.id so they
+                          silently skip shared rows — hide the checkbox
+                          on those to avoid the dead-end UX. */}
+                      {!tx.is_shared && (
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.has(tx.id)}
+                          onChange={() => toggleSelect(tx.id)}
+                          onClick={(e) => e.stopPropagation()}
+                          className="h-4 w-4 rounded border-border accent-primary cursor-pointer"
+                        />
+                      )}
+                    </TableCell>
+                    {grid.visibleColumns.map(col => renderBodyCell(col, tx))}
+                  </TableRow>
+                ))}
+                {filteredItems.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={grid.visibleColumns.length + 1} className="text-center py-16 text-muted-foreground">
+                      {t('transactions.noResults')}
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Pagination */}
       {totalPages > 1 && (
