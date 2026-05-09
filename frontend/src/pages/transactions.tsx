@@ -869,6 +869,7 @@ export default function TransactionsPage() {
         section={t('transactions.section')}
         title={t('transactions.title')}
         action={
+          isMobile ? null : (
           <div className="flex items-center gap-2">
             <TransactionsColumnPicker state={grid} />
             <Button
@@ -934,6 +935,7 @@ export default function TransactionsPage() {
               + {t('transactions.addManual')}
             </Button>
           </div>
+          )
         }
       />
 
