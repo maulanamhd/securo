@@ -60,19 +60,21 @@ services:
   frontend:
     build:
       context: ./frontend
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.dev
     ports:
-      - "192.168.2.1:1234:80"
+    #  - "192.168.2.1:1234:80" #Release
+       - "192.168.2.1:1234:5173" #Dev
     environment:
       BACKEND_URL: http://backend:8000
-      FRONTEND_URL: http://localhost:3000
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
       APP_VERSION_ROOT: /workspace
     depends_on:
       - backend
-    #volumes:
-    #  - ./frontend:/app
-    #  - ./:/workspace:ro
-    #  - /app/node_modules
+    volumes:
+      - ./frontend:/app
+      - ./:/workspace:ro
+      - /app/node_modules
+      - attachments:/app/data/attachments
     restart: unless-stopped
 
   celery-worker:
